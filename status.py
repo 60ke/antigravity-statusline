@@ -48,6 +48,10 @@ QUOTA_CACHE_FILE = os.environ.get(
     "AGY_QUOTA_CACHE",
     os.path.expanduser("~/.antigravity/quota-cache.json"),
 )
+STATUS_STATE_FILE = os.environ.get(
+    "AGY_STATUS_STATE",
+    os.path.expanduser("~/.antigravity/status-state.json"),
+)
 QUOTA_MAX_AGE_SECONDS = float(os.environ.get("AGY_QUOTA_MAX_AGE_SECONDS", "900"))
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -80,7 +84,48 @@ def quota_color(pct: float) -> str:
     return RED
 
 
-def load_quota_for_model(model_name: str) -> dict:
+def quota_scope(data: dict) -> dict:
+    return {
+        "email": data.get("email") or "",
+        "plan_tier": data.get("plan_tier") or "",
+        "session_id": data.get("conversation_id") or data.get("session_id") or "",
+    }
+
+
+def write_status_state(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATUS_STATE_FILE), exist_ok=True)
+        state = quota_scope(data)
+        model_info = data.get("model", {})
+        if isinstance(model_info, dict):
+            state["model"] = model_info.get("display_name") or model_info.get("id") or ""
+        else:
+            state["model"] = str(model_info or "")
+        state["timestamp"] = time.time()
+        with open(STATUS_STATE_FILE, "w") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def scope_mismatch(cache: dict, data: dict) -> str:
+    expected = quota_scope(data)
+    actual = cache.get("scope", {})
+    if not isinstance(actual, dict):
+        return "scope"
+
+    for key, label in (
+        ("email", "account"),
+        ("plan_tier", "plan"),
+        ("session_id", "session"),
+    ):
+        if expected.get(key) and actual.get(key) != expected.get(key):
+            return label
+    return ""
+
+
+def load_quota_for_model(model_name: str, data: dict) -> dict:
     """Read the latest /usage cache and return the entry for the active model."""
     try:
         with open(QUOTA_CACHE_FILE, "r") as f:
@@ -88,9 +133,13 @@ def load_quota_for_model(model_name: str) -> dict:
     except Exception:
         return {}
 
+    mismatch = scope_mismatch(cache, data)
+    if mismatch:
+        return {"stale": True, "reason": mismatch}
+
     ts = float(cache.get("timestamp", 0) or 0)
     if ts and time.time() - ts > QUOTA_MAX_AGE_SECONDS:
-        return {"stale": True}
+        return {"stale": True, "reason": "age"}
 
     models = cache.get("models", {})
     if not isinstance(models, dict):
@@ -177,9 +226,10 @@ def render(data: dict) -> str:
     )
 
     # 5. Quota from the cached /usage output for the active model
-    quota = load_quota_for_model(raw_name)
+    quota = load_quota_for_model(raw_name, data)
     if quota.get("stale"):
-        quota_display = f"{GRAY}⬡ Quota: stale{RESET}"
+        reason = quota.get("reason", "stale")
+        quota_display = f"{GRAY}⬡ Quota: sync /usage ({reason}){RESET}"
     elif "remaining_percentage" in quota:
         quota_pct = float(quota["remaining_percentage"])
         qc = quota_color(quota_pct)
@@ -244,6 +294,7 @@ def main():
                             data, idx = decoder.raw_decode(stripped)
                             buffer = stripped[idx:]
                             if isinstance(data, dict) and "model" in data:
+                                write_status_state(data)
                                 last_data = data
                                 print(render(last_data), flush=True)
                                 last_redraw_time = time.time()

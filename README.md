@@ -61,6 +61,17 @@ Gemini 3.1 Pro (High)
 
 缓存器会把 `Gemini 3.1 Pro (High)` 解析为 `40%`。同一次复制只更新复制内容中出现的模型，其他模型会保留上一次缓存值。
 
+## 缓存生命周期
+
+状态栏会把 quota 缓存绑定到当前 `email`、`plan_tier` 和 `session_id/conversation_id`：
+
+- 新开一个对话后，旧缓存会失效，状态栏显示 `Quota: sync /usage (session)`。
+- 登录、登出或切换账号后，旧缓存会失效，状态栏显示 `Quota: sync /usage (account)`。
+- 套餐信息变化后，旧缓存会失效，状态栏显示 `Quota: sync /usage (plan)`。
+- 缓存超过 `AGY_QUOTA_MAX_AGE_SECONDS` 后，状态栏显示 `Quota: sync /usage (age)`。
+
+失效后，在 Antigravity CLI 里重新运行 `/usage`，复制输出，再执行 `pbpaste | python3 ~/.antigravity/agy-quota-cache.py` 即可恢复当前会话的真实 quota。
+
 ## 可选环境变量
 
 - `AGY_QUOTA_CACHE`: 自定义 quota 缓存路径。

@@ -15,6 +15,10 @@ CACHE_FILE = os.environ.get(
     "AGY_QUOTA_CACHE",
     os.path.expanduser("~/.antigravity/quota-cache.json"),
 )
+STATUS_STATE_FILE = os.environ.get(
+    "AGY_STATUS_STATE",
+    os.path.expanduser("~/.antigravity/status-state.json"),
+)
 
 
 def normalize_model_name(name: str) -> str:
@@ -72,6 +76,20 @@ def load_existing_cache() -> dict:
     return models if isinstance(models, dict) else {}
 
 
+def load_status_scope() -> dict:
+    try:
+        with open(STATUS_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+
+    return {
+        "email": state.get("email") or "",
+        "plan_tier": state.get("plan_tier") or "",
+        "session_id": state.get("session_id") or "",
+    }
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         with open(sys.argv[1], "r", encoding="utf-8") as f:
@@ -90,7 +108,11 @@ def main() -> int:
     os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"timestamp": time.time(), "models": merged_models},
+            {
+                "timestamp": time.time(),
+                "scope": load_status_scope(),
+                "models": merged_models,
+            },
             f,
             ensure_ascii=False,
             indent=2,
