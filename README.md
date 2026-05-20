@@ -58,10 +58,12 @@ The uninstaller removes the installed scripts and removes this repo's `statusLin
 The status line automatically:
 
 - finds the local Antigravity `language_server` process
+- finds local `agy` CLI server processes
 - extracts the local CSRF token from its command line
 - discovers the local listening port
 - calls `GetUserStatus`
 - matches quota by the active model label
+- prefers the local API response whose email matches the current Antigravity CLI session
 
 Quota refreshes every 30 seconds by default. It also refreshes immediately when the active session/account/model changes or when the cache is missing.
 
@@ -156,10 +158,12 @@ cd antigravity-statusline
 状态栏会自动：
 
 - 查找本机 Antigravity `language_server` 进程
+- 查找本机 `agy` CLI server 进程
 - 从进程命令行提取本地 CSRF token
 - 发现本地监听端口
 - 调用 `GetUserStatus`
 - 按当前模型名称匹配 quota
+- 优先使用 email 与当前 Antigravity CLI 会话一致的本地 API 响应
 
 默认每 30 秒刷新一次。新会话、账号、模型变化或缓存不存在时，会立即刷新。
 

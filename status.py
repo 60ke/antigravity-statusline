@@ -116,16 +116,18 @@ def extract_arg(command_line: str, name: str) -> str:
     return match.group(1).strip("\"'")
 
 
-def find_language_server() -> dict:
+def find_server_candidates() -> list[dict]:
     try:
         ps = subprocess.check_output(["ps", "auxww"], text=True, timeout=1.5)
     except Exception:
-        return {}
+        return []
 
     candidates = []
     for line in ps.splitlines():
         lower = line.lower()
-        if "language_server" not in lower or "--csrf_token" not in line:
+        is_cli = re.search(r"\bagy(\s|$)", line) is not None
+        is_language_server = "language_server" in lower
+        if not is_cli and not is_language_server:
             continue
         parts = line.split(None, 10)
         if len(parts) < 11:
@@ -135,17 +137,23 @@ def find_language_server() -> dict:
         except ValueError:
             continue
         token = extract_arg(parts[10], "--csrf_token")
+        score = 10
+        if is_cli:
+            score += 40
+        if is_language_server:
+            score += 20
         if token:
-            score = 10
-            if "/applications/antigravity.app" in lower:
-                score += 20
-            if "--app_data_dir antigravity" in lower or "--app_data_dir=antigravity" in lower:
-                score += 10
-            candidates.append({"pid": pid, "csrf_token": token, "score": score})
+            score += 10
+        if "/applications/antigravity.app" in lower:
+            score -= 10
+        candidates.append({
+            "pid": pid,
+            "csrf_token": token,
+            "score": score,
+            "kind": "cli" if is_cli else "language_server",
+        })
 
-    if not candidates:
-        return {}
-    return sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
+    return sorted(candidates, key=lambda x: x["score"], reverse=True)
 
 
 def get_listening_ports(pid: int) -> list[int]:
@@ -178,8 +186,9 @@ def request_user_status(port: int, csrf_token: str, use_https: bool) -> dict:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Connect-Protocol-Version": "1",
-        "X-Codeium-Csrf-Token": csrf_token,
     }
+    if csrf_token:
+        headers["X-Codeium-Csrf-Token"] = csrf_token
     if use_https:
         conn = http.client.HTTPSConnection(
             "127.0.0.1",
@@ -232,22 +241,33 @@ def parse_user_status_quota(response: dict) -> dict:
     }
 
 
-def fetch_live_quota_cache() -> dict:
-    process_info = find_language_server()
-    if not process_info:
-        return {}
+def fetch_live_quota_cache(expected_email: str = "") -> dict:
+    fallback = {}
+    expected = (expected_email or "").lower()
 
-    ports = get_listening_ports(process_info["pid"])
-    for port in ports:
-        for use_https in (True, False):
-            try:
-                response = request_user_status(port, process_info["csrf_token"], use_https)
-                cache = parse_user_status_quota(response)
-                if cache.get("models"):
-                    return cache
-            except Exception:
-                continue
-    return {}
+    for process_info in find_server_candidates():
+        ports = get_listening_ports(process_info["pid"])
+        for port in ports:
+            for use_https in (True, False):
+                try:
+                    response = request_user_status(
+                        port,
+                        process_info.get("csrf_token", ""),
+                        use_https,
+                    )
+                    cache = parse_user_status_quota(response)
+                    if not cache.get("models"):
+                        continue
+                    cache["source_process"] = process_info.get("kind", "")
+                    cache["source_port"] = port
+                    email = str(cache.get("scope", {}).get("email", "")).lower()
+                    if expected and email == expected:
+                        return cache
+                    if not fallback:
+                        fallback = cache
+                except Exception:
+                    continue
+    return fallback
 
 
 def read_json_file(path: str) -> dict:
@@ -332,7 +352,7 @@ def should_refresh_quota(data: dict, cache: dict) -> bool:
 def refresh_quota_if_needed(data: dict) -> dict:
     cache = read_json_file(QUOTA_CACHE_FILE)
     if should_refresh_quota(data, cache):
-        live_cache = fetch_live_quota_cache()
+        live_cache = fetch_live_quota_cache(data.get("email") or "")
         if live_cache:
             cache = live_cache
             write_quota_cache(cache)
