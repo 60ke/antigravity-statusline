@@ -10,6 +10,10 @@ import os
 import random
 import select
 import re
+import subprocess
+import http.client
+import ssl
+from datetime import datetime, timezone
 
 # ── ANSI Colors ────────────────────────────────────────────────────────────────
 RESET        = "\033[0m"
@@ -53,6 +57,8 @@ STATUS_STATE_FILE = os.environ.get(
     os.path.expanduser("~/.antigravity/status-state.json"),
 )
 QUOTA_MAX_AGE_SECONDS = float(os.environ.get("AGY_QUOTA_MAX_AGE_SECONDS", "900"))
+QUOTA_REFRESH_INTERVAL_SECONDS = float(os.environ.get("AGY_QUOTA_REFRESH_INTERVAL_SECONDS", "30"))
+USER_STATUS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def format_tokens(n: int) -> str:
@@ -84,11 +90,189 @@ def quota_color(pct: float) -> str:
     return RED
 
 
+def format_reset_time(reset_time: str) -> str:
+    try:
+        reset = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+        diff = int((reset - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return ""
+
+    if diff <= 0:
+        return "now"
+    minutes = (diff + 59) // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, mins = divmod(minutes, 60)
+    if hours >= 24:
+        days, rem_hours = divmod(hours, 24)
+        return f"{days}d {rem_hours}h" if rem_hours else f"{days}d"
+    return f"{hours}h {mins}m" if mins else f"{hours}h"
+
+
+def extract_arg(command_line: str, name: str) -> str:
+    match = re.search(rf"{re.escape(name)}(?:=|\s+)([^\s\"']+|\"[^\"]+\"|'[^']+')", command_line)
+    if not match:
+        return ""
+    return match.group(1).strip("\"'")
+
+
+def find_language_server() -> dict:
+    try:
+        ps = subprocess.check_output(["ps", "auxww"], text=True, timeout=1.5)
+    except Exception:
+        return {}
+
+    candidates = []
+    for line in ps.splitlines():
+        lower = line.lower()
+        if "language_server" not in lower or "--csrf_token" not in line:
+            continue
+        parts = line.split(None, 10)
+        if len(parts) < 11:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        token = extract_arg(parts[10], "--csrf_token")
+        if token:
+            score = 10
+            if "/applications/antigravity.app" in lower:
+                score += 20
+            if "--app_data_dir antigravity" in lower or "--app_data_dir=antigravity" in lower:
+                score += 10
+            candidates.append({"pid": pid, "csrf_token": token, "score": score})
+
+    if not candidates:
+        return {}
+    return sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
+
+
+def get_listening_ports(pid: int) -> list[int]:
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"],
+            text=True,
+            timeout=1.5,
+        )
+    except Exception:
+        return []
+
+    ports = []
+    for match in re.finditer(r":(\d+)\s+\(LISTEN\)", out):
+        port = int(match.group(1))
+        if port not in ports:
+            ports.append(port)
+    return sorted(ports)
+
+
+def request_user_status(port: int, csrf_token: str, use_https: bool) -> dict:
+    body = json.dumps({
+        "metadata": {
+            "ideName": "antigravity",
+            "extensionName": "antigravity",
+            "locale": "en",
+        }
+    })
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Connect-Protocol-Version": "1",
+        "X-Codeium-Csrf-Token": csrf_token,
+    }
+    if use_https:
+        conn = http.client.HTTPSConnection(
+            "127.0.0.1",
+            port,
+            timeout=2,
+            context=ssl._create_unverified_context(),
+        )
+    else:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    conn.request("POST", USER_STATUS_PATH, body, headers)
+    res = conn.getresponse()
+    raw = res.read().decode("utf-8", "replace")
+    if res.status < 200 or res.status >= 300:
+        raise RuntimeError(f"HTTP {res.status}")
+    return json.loads(raw)
+
+
+def parse_user_status_quota(response: dict) -> dict:
+    user_status = response.get("userStatus", {})
+    plan_status = user_status.get("planStatus", {})
+    plan_info = plan_status.get("planInfo", {})
+    cascade = user_status.get("cascadeModelConfigData", {})
+    models = {}
+
+    for model in cascade.get("clientModelConfigs", []) or []:
+        quota_info = model.get("quotaInfo") or {}
+        if "remainingFraction" not in quota_info:
+            continue
+        label = model.get("label") or model.get("modelOrAlias", {}).get("model") or "Unknown"
+        remaining = max(0.0, min(100.0, float(quota_info.get("remainingFraction", 0)) * 100))
+        entry = {
+            "name": label,
+            "remaining_percentage": remaining,
+            "source": "local_language_server",
+        }
+        reset_time = quota_info.get("resetTime")
+        if reset_time:
+            entry["reset_time"] = reset_time
+            entry["refreshes_in"] = format_reset_time(reset_time)
+        models[normalize_model_name(label)] = entry
+
+    return {
+        "timestamp": time.time(),
+        "source": "local_language_server",
+        "scope": {
+            "email": user_status.get("email") or "",
+            "plan_tier": plan_info.get("planName") or "",
+        },
+        "models": models,
+    }
+
+
+def fetch_live_quota_cache() -> dict:
+    process_info = find_language_server()
+    if not process_info:
+        return {}
+
+    ports = get_listening_ports(process_info["pid"])
+    for port in ports:
+        for use_https in (True, False):
+            try:
+                response = request_user_status(port, process_info["csrf_token"], use_https)
+                cache = parse_user_status_quota(response)
+                if cache.get("models"):
+                    return cache
+            except Exception:
+                continue
+    return {}
+
+
+def read_json_file(path: str) -> dict:
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_quota_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(QUOTA_CACHE_FILE), exist_ok=True)
+        with open(QUOTA_CACHE_FILE, "w") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception:
+        pass
+
+
 def quota_scope(data: dict) -> dict:
     return {
         "email": data.get("email") or "",
         "plan_tier": data.get("plan_tier") or "",
-        "session_id": data.get("conversation_id") or data.get("session_id") or "",
     }
 
 
@@ -96,6 +280,7 @@ def write_status_state(data: dict) -> None:
     try:
         os.makedirs(os.path.dirname(STATUS_STATE_FILE), exist_ok=True)
         state = quota_scope(data)
+        state["session_id"] = data.get("conversation_id") or data.get("session_id") or ""
         model_info = data.get("model", {})
         if isinstance(model_info, dict):
             state["model"] = model_info.get("display_name") or model_info.get("id") or ""
@@ -118,19 +303,46 @@ def scope_mismatch(cache: dict, data: dict) -> str:
     for key, label in (
         ("email", "account"),
         ("plan_tier", "plan"),
-        ("session_id", "session"),
     ):
-        if expected.get(key) and actual.get(key) != expected.get(key):
+        # CLI status JSON says "Google AI Pro"; local API says "Pro".
+        if key == "plan_tier" and expected.get(key) and actual.get(key):
+            if expected[key].lower().endswith(str(actual[key]).lower()):
+                continue
+        if expected.get(key) and actual.get(key) and actual.get(key) != expected.get(key):
             return label
     return ""
 
 
+def should_refresh_quota(data: dict, cache: dict) -> bool:
+    if not cache:
+        return True
+    now = time.time()
+    ts = float(cache.get("timestamp", 0) or 0)
+    if not ts or now - ts >= QUOTA_REFRESH_INTERVAL_SECONDS:
+        return True
+    state = read_json_file(STATUS_STATE_FILE)
+    current_session = data.get("conversation_id") or data.get("session_id") or ""
+    if current_session and state.get("session_id") and state.get("session_id") != current_session:
+        return True
+    if scope_mismatch(cache, data):
+        return True
+    return False
+
+
+def refresh_quota_if_needed(data: dict) -> dict:
+    cache = read_json_file(QUOTA_CACHE_FILE)
+    if should_refresh_quota(data, cache):
+        live_cache = fetch_live_quota_cache()
+        if live_cache:
+            cache = live_cache
+            write_quota_cache(cache)
+    return cache
+
+
 def load_quota_for_model(model_name: str, data: dict) -> dict:
     """Read the latest /usage cache and return the entry for the active model."""
-    try:
-        with open(QUOTA_CACHE_FILE, "r") as f:
-            cache = json.load(f)
-    except Exception:
+    cache = refresh_quota_if_needed(data)
+    if not cache:
         return {}
 
     mismatch = scope_mismatch(cache, data)

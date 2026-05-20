@@ -1,6 +1,6 @@
 # Antigravity CLI Status Line
 
-一个给 Anti Gravity / Antigravity CLI 用的状态栏配置：显示当前模型、Agent 状态、上下文剩余百分比、当前目录、当前模型的真实 `/usage` quota 剩余百分比，以及本轮 token 统计。
+一个给 Anti Gravity / Antigravity CLI 用的状态栏配置：显示当前模型、Agent 状态、上下文剩余百分比、当前目录、当前模型的真实 quota 剩余百分比，以及本轮 token 统计。
 
 ## 效果
 
@@ -34,25 +34,33 @@ chmod +x ~/.antigravity/status.py ~/.antigravity/agy-quota-cache.py
 }
 ```
 
-## 同步真实 Quota
+## 真实 Quota
 
-Antigravity 的真实模型额度来自内置 `/usage` 命令。状态栏不会伪造 quota，只读取 `/usage` 的缓存。
+状态栏会直接读取本机 Antigravity `language_server` 的 `GetUserStatus` 接口，数据来源和内置 `/usage` 是同一套本地状态。它会自动发现：
 
-在 Antigravity CLI 里运行 `/usage`，复制输出，然后执行：
+- `language_server` 进程
+- 本地监听端口
+- `X-Codeium-Csrf-Token`
 
-```bash
-pbpaste | python3 ~/.antigravity/agy-quota-cache.py
-```
+默认每 30 秒刷新一次 quota。新开对话、账号变化、缓存不存在或当前模型缺失时，会立即刷新，不需要手动复制 `/usage` 输出。
 
-默认缓存位置是：
+刷新结果会写入本地缓存，接口短暂失败时可回退显示上一次成功结果：
 
 ```text
 ~/.antigravity/quota-cache.json
 ```
 
-状态栏会按当前模型名称匹配缓存中的 quota，例如 `Gemini 3.1 Pro (High)` 只显示这一行模型的剩余量。缓存过期或不存在时会显示 `Quota: sync /usage`，不会展示假百分比。
+状态栏会按当前模型名称匹配缓存中的 quota，例如 `Gemini 3.1 Pro (High)` 只显示这一行模型的剩余量。
 
-如果 `/usage` 弹层显示：
+## 手动备用
+
+如果本地接口不可用，也可以用内置 `/usage` 弹层作为备用：在 Antigravity CLI 里运行 `/usage`，复制输出，然后执行：
+
+```bash
+pbpaste | python3 ~/.antigravity/agy-quota-cache.py
+```
+
+例如 `/usage` 弹层显示：
 
 ```text
 Gemini 3.1 Pro (High)
@@ -61,18 +69,8 @@ Gemini 3.1 Pro (High)
 
 缓存器会把 `Gemini 3.1 Pro (High)` 解析为 `40%`。同一次复制只更新复制内容中出现的模型，其他模型会保留上一次缓存值。
 
-## 缓存生命周期
-
-状态栏会把 quota 缓存绑定到当前 `email`、`plan_tier` 和 `session_id/conversation_id`：
-
-- 新开一个对话后，旧缓存会失效，状态栏显示 `Quota: sync /usage (session)`。
-- 登录、登出或切换账号后，旧缓存会失效，状态栏显示 `Quota: sync /usage (account)`。
-- 套餐信息变化后，旧缓存会失效，状态栏显示 `Quota: sync /usage (plan)`。
-- 缓存超过 `AGY_QUOTA_MAX_AGE_SECONDS` 后，状态栏显示 `Quota: sync /usage (age)`。
-
-失效后，在 Antigravity CLI 里重新运行 `/usage`，复制输出，再执行 `pbpaste | python3 ~/.antigravity/agy-quota-cache.py` 即可恢复当前会话的真实 quota。
-
 ## 可选环境变量
 
 - `AGY_QUOTA_CACHE`: 自定义 quota 缓存路径。
 - `AGY_QUOTA_MAX_AGE_SECONDS`: quota 缓存有效期，默认 `900` 秒。
+- `AGY_QUOTA_REFRESH_INTERVAL_SECONDS`: 自动刷新间隔，默认 `30` 秒。

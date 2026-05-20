@@ -86,7 +86,6 @@ def load_status_scope() -> dict:
     return {
         "email": state.get("email") or "",
         "plan_tier": state.get("plan_tier") or "",
-        "session_id": state.get("session_id") or "",
     }
 
 
