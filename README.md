@@ -17,7 +17,7 @@ It reads quota directly from the local Antigravity `language_server` `GetUserSta
 ## Preview
 
 ```text
-Gemini 3.1 Pro (High) | Idle | Context 92% left | ~/Desktop/opc/right-enhance | Quota: 40% | ↑85k ↓15k 100k tok
+Gemini 3.1 Pro (High) | Idle | Context 92% left | ~/Desktop/opc/right-enhance | Quota: 40% · reset 1h 21m | ↑85k ↓15k 100k tok
   Tip: Use /agents to see all active sub-agents and their status.
 ```
 
@@ -64,6 +64,7 @@ The status line automatically:
 - calls `GetUserStatus`
 - matches quota by the active model label
 - prefers the local API response whose email matches the current Antigravity CLI session
+- shows the reset countdown from the model quota reset time
 
 Quota refreshes every 30 seconds by default. It also refreshes immediately when the active session/account/model changes or when the cache is missing.
 
@@ -117,7 +118,7 @@ pbpaste | python3 ~/.antigravity/agy-quota-cache.py
 ## 效果
 
 ```text
-Gemini 3.1 Pro (High) | Idle | Context 92% left | ~/Desktop/opc/right-enhance | Quota: 40% | ↑85k ↓15k 100k tok
+Gemini 3.1 Pro (High) | Idle | Context 92% left | ~/Desktop/opc/right-enhance | Quota: 40% · reset 1h 21m | ↑85k ↓15k 100k tok
   Tip: Use /agents to see all active sub-agents and their status.
 ```
 
@@ -164,6 +165,7 @@ cd antigravity-statusline
 - 调用 `GetUserStatus`
 - 按当前模型名称匹配 quota
 - 优先使用 email 与当前 Antigravity CLI 会话一致的本地 API 响应
+- 根据模型 quota reset time 显示重置倒计时
 
 默认每 30 秒刷新一次。新会话、账号、模型变化或缓存不存在时，会立即刷新。
 

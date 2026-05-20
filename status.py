@@ -465,7 +465,9 @@ def render(data: dict) -> str:
     elif "remaining_percentage" in quota:
         quota_pct = float(quota["remaining_percentage"])
         qc = quota_color(quota_pct)
-        quota_display = f"{qc}⬡ Quota: {quota_pct:.0f}%{RESET}"
+        reset_in = quota.get("refreshes_in") or ""
+        reset_display = f"{GRAY} · reset {reset_in}{RESET}" if reset_in else ""
+        quota_display = f"{qc}⬡ Quota: {quota_pct:.0f}%{RESET}{reset_display}"
     else:
         quota_display = f"{GRAY}⬡ Quota: sync /usage{RESET}"
 
