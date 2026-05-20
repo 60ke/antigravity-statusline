@@ -16,6 +16,8 @@ It reads quota directly from the local Antigravity `language_server` `GetUserSta
 
 ## Preview
 
+![Antigravity CLI status line preview](assets/statusline-preview.png)
+
 ```text
 Gemini 3.1 Pro (High) | Idle | Context 92% left | ~/Desktop/opc/right-enhance | Quota: 40% · reset 1h 21m | ↑85k ↓15k 100k tok
   Tip: Use /agents to see all active sub-agents and their status.
@@ -116,6 +118,8 @@ pbpaste | python3 ~/.antigravity/agy-quota-cache.py
 它会直接读取本机 Antigravity `language_server` 的 `GetUserStatus` 接口，数据来源和内置 `/usage` 是同一套本地状态。正常情况下不需要手动同步。
 
 ## 效果
+
+![Antigravity CLI 状态栏预览](assets/statusline-preview.png)
 
 ```text
 Gemini 3.1 Pro (High) | Idle | Context 92% left | ~/Desktop/opc/right-enhance | Quota: 40% · reset 1h 21m | ↑85k ↓15k 100k tok
