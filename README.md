@@ -52,8 +52,16 @@ pbpaste | python3 ~/.antigravity/agy-quota-cache.py
 
 状态栏会按当前模型名称匹配缓存中的 quota，例如 `Gemini 3.1 Pro (High)` 只显示这一行模型的剩余量。缓存过期或不存在时会显示 `Quota: sync /usage`，不会展示假百分比。
 
+如果 `/usage` 弹层显示：
+
+```text
+Gemini 3.1 Pro (High)
+40% remaining · Refreshes in 1h 32m
+```
+
+缓存器会把 `Gemini 3.1 Pro (High)` 解析为 `40%`。同一次复制只更新复制内容中出现的模型，其他模型会保留上一次缓存值。
+
 ## 可选环境变量
 
 - `AGY_QUOTA_CACHE`: 自定义 quota 缓存路径。
 - `AGY_QUOTA_MAX_AGE_SECONDS`: quota 缓存有效期，默认 `900` 秒。
-

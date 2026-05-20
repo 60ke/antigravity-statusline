@@ -38,11 +38,15 @@ def parse_usage(text: str) -> dict:
         pct = re.search(r"(\d{1,3})\s*%", line)
         if current and pct:
             remaining = max(0, min(100, int(pct.group(1))))
-            models[normalize_model_name(current)] = {
+            entry = {
                 "name": current,
                 "remaining_percentage": remaining,
                 "source": "/usage",
             }
+            refresh = re.search(r"refreshes\s+in\s+(.+)$", line, re.IGNORECASE)
+            if refresh:
+                entry["refreshes_in"] = refresh.group(1).strip()
+            models[normalize_model_name(current)] = entry
             continue
 
         if current and "quota available" in line.lower():
@@ -58,6 +62,16 @@ def parse_usage(text: str) -> dict:
     return models
 
 
+def load_existing_cache() -> dict:
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        return {}
+    models = cache.get("models", {})
+    return models if isinstance(models, dict) else {}
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         with open(sys.argv[1], "r", encoding="utf-8") as f:
@@ -70,10 +84,13 @@ def main() -> int:
         print("No /usage model quota rows found.", file=sys.stderr)
         return 1
 
+    merged_models = load_existing_cache()
+    merged_models.update(models)
+
     os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"timestamp": time.time(), "models": models},
+            {"timestamp": time.time(), "models": merged_models},
             f,
             ensure_ascii=False,
             indent=2,
@@ -81,7 +98,7 @@ def main() -> int:
         )
         f.write("\n")
 
-    print(f"Cached {len(models)} model quota entries to {CACHE_FILE}")
+    print(f"Cached {len(models)} updated model quota entries to {CACHE_FILE}")
     return 0
 
 
