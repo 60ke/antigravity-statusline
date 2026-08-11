@@ -320,16 +320,12 @@ def scope_mismatch(cache: dict, data: dict) -> str:
     if not isinstance(actual, dict):
         return "scope"
 
-    for key, label in (
-        ("email", "account"),
-        ("plan_tier", "plan"),
-    ):
-        # CLI status JSON says "Google AI Pro"; local API says "Pro".
-        if key == "plan_tier" and expected.get(key) and actual.get(key):
-            if expected[key].lower().endswith(str(actual[key]).lower()):
-                continue
-        if expected.get(key) and actual.get(key) and actual.get(key) != expected.get(key):
-            return label
+    # Only flag mismatch if user emails differ. Plan tier labels can differ between CLI payloads
+    # (e.g., "Antigravity Starter Quota", "Google AI Pro") and API responses ("Pro", "Starter").
+    expected_email = (expected.get("email") or "").lower()
+    actual_email = (actual.get("email") or "").lower()
+    if expected_email and actual_email and expected_email != actual_email:
+        return "account"
     return ""
 
 
