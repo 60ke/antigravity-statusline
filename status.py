@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Antigravity IDE — Status Line Script
-Row 1: model · state · context left · path · branch · quota · session tokens
-Row 2: 💡 Tip  (rotates at most once every 3 seconds, persisted across restarts)
+Responsive status line with dynamic multi-line wrapping:
+model · state · context left · path · branch · quota · session tokens
 """
 import sys
 import json
 import time
 import os
-import random
 import select
 import re
 import subprocess
 import http.client
 import ssl
+import shutil
 from datetime import datetime, timezone
 
 # ── ANSI Colors ────────────────────────────────────────────────────────────────
@@ -30,24 +30,45 @@ CYAN         = "\033[36m"
 BLUE         = "\033[34m"
 PURPLE       = "\033[38;5;141m"
 
-# ── Tips ───────────────────────────────────────────────────────────────────────
-TIPS = [
-    "Use /goal for complex, multi-step tasks that need deep focus.",
-    "Press Ctrl+O to expand tool output details inline.",
-    "Try /grill-me to refine your implementation plan interactively.",
-    "Use /agents to see all active sub-agents and their status.",
-    "Mention @conversation to reference past work in any session.",
-    "Run agy --sandbox for restricted, sandboxed command execution.",
-    "Use /schedule to automate recurring tasks or set reminders.",
-    "Press Ctrl+R to search through your full command history.",
-    "Use /changelog to see what's new in the latest release.",
-    "Drag a file into the chat to attach it as context.",
-    "Use /goal overnight for thorough, unattended long-running tasks.",
-    "Prefix a message with ! to run it as a shell command directly.",
-]
+# ── Responsive & Width Helpers ─────────────────────────────────────────────────
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
-TIP_CACHE_FILE = "/tmp/agy_status_tip.json"
-TIP_MIN_SECONDS = 3.0   # minimum seconds before rotating to the next tip
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def visible_length(text: str) -> int:
+    return len(strip_ansi(text))
+
+
+def get_terminal_width(data: dict) -> int:
+    w = data.get("terminal_width")
+    if isinstance(w, (int, float)) and w > 0:
+        return int(w)
+    w = data.get("columns")
+    if isinstance(w, (int, float)) and w > 0:
+        return int(w)
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        pass
+    try:
+        return int(os.environ.get("COLUMNS", 80))
+    except Exception:
+        return 80
+
+
+def shorten_path(path: str, max_chars: int = 28) -> str:
+    if len(path) <= max_chars:
+        return path
+    parts = path.split(os.sep)
+    if len(parts) <= 2:
+        return path
+    shortened = parts[0] + os.sep + "…" + os.sep + os.sep.join(parts[-2:])
+    return shortened if len(shortened) < len(path) else path
+
+
 QUOTA_CACHE_FILE = os.environ.get(
     "AGY_QUOTA_CACHE",
     os.path.expanduser("~/.antigravity/quota-cache.json"),
@@ -452,36 +473,6 @@ def load_quota_for_model(model_name: str, data: dict) -> dict:
     return {}
 
 
-def get_tip(force_rotate=False) -> str:
-    """Return the current tip. Rotate if force_rotate is True or if time is up."""
-    now = time.time()
-    tip = ""
-    ts = 0.0
-
-    try:
-        with open(TIP_CACHE_FILE, "r") as f:
-            cache = json.load(f)
-        tip = cache.get("tip", "")
-        ts  = float(cache.get("timestamp", 0))
-    except Exception:
-        pass
-
-    if tip and not force_rotate and (now - ts) < TIP_MIN_SECONDS:
-        return tip
-
-    # Pick a new tip that's different from the current one if possible
-    choices = [t for t in TIPS if t != tip] or TIPS
-    new_tip = random.choice(choices)
-    
-    try:
-        with open(TIP_CACHE_FILE, "w") as f:
-            json.dump({"tip": new_tip, "timestamp": now}, f)
-    except Exception:
-        pass
-        
-    return new_tip
-
-
 # ── Rendering ──────────────────────────────────────────────────────────────────
 SEP = f" {GRAY}│{RESET} "
 
@@ -490,7 +481,7 @@ def render(data: dict) -> str:
     # 1. Model
     model_info = data.get("model", {})
     if isinstance(model_info, dict):
-        raw_name = model_info.get("display_name") or model_info.get("id") or "AGY"
+        raw_name = model_info.get("display_name") or model_info.get("displayName") or model_info.get("id") or "AGY"
     else:
         raw_name = str(model_info) or "AGY"
     model_display = f"{YELLOW}{BOLD}{raw_name}{RESET}"
@@ -541,6 +532,11 @@ def render(data: dict) -> str:
     home = os.path.expanduser("~")
     if cwd.startswith(home):
         cwd = "~" + cwd[len(home):]
+
+    term_width = get_terminal_width(data)
+    if term_width < 80 and len(cwd) > 28:
+        cwd = shorten_path(cwd, 24)
+
     path_display = f"{GREEN}{cwd}{RESET}"
 
     # 7. Git branch status
@@ -550,11 +546,7 @@ def render(data: dict) -> str:
     sandbox_enabled = data.get("sandbox", {}).get("enabled", False)
     sandbox_str = f" {ORANGE}[sandbox]{RESET}" if sandbox_enabled else ""
 
-    # 9. Tip (stable for ≥ 3 s)
-    tip         = get_tip()
-    tip_display = f"{BLUE}💡 {tip}{RESET}"
-
-    # ── Assemble rows ──────────────────────────────────────────────────────────
+    # ── Assemble segments ──────────────────────────────────────────────────────
     segments = [
         model_display,
         state_display,
@@ -567,10 +559,36 @@ def render(data: dict) -> str:
         quota_display,
         tokens_display,
     ])
-    row1 = SEP.join(segments)
-    row2 = f"  {tip_display}"
 
-    return f"{row1}\n{row2}"
+    # ── Responsive Line Packing ────────────────────────────────────────────────
+    sep_vis_len = visible_length(SEP)
+    total_single_line_len = sum(visible_length(s) for s in segments) + sep_vis_len * (len(segments) - 1)
+
+    if total_single_line_len <= term_width:
+        return SEP.join(segments)
+
+    rows: list[str] = []
+    current_row: list[str] = []
+    current_row_len = 0
+
+    for seg in segments:
+        seg_len = visible_length(seg)
+        if not current_row:
+            current_row.append(seg)
+            current_row_len = seg_len
+        else:
+            if current_row_len + sep_vis_len + seg_len <= term_width:
+                current_row.append(seg)
+                current_row_len += sep_vis_len + seg_len
+            else:
+                rows.append(SEP.join(current_row))
+                current_row = [seg]
+                current_row_len = seg_len
+
+    if current_row:
+        rows.append(SEP.join(current_row))
+
+    return "\n".join(rows)
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -608,24 +626,11 @@ def main():
                         except json.JSONDecodeError:
                             break
             
-            # If no input arrived recently, but we have last_data, check if we should rotate tip
             elif last_data:
                 now = time.time()
-                # Check if 3 seconds have passed since we last got a new tip
-                # get_tip() handles the 3-second cache logic internally
-                current_tip = get_tip()
-                # To actually redraw on idle state, we force print if 3 seconds passed
-                try:
-                    with open(TIP_CACHE_FILE, "r") as f:
-                        cache = json.load(f)
-                        ts = float(cache.get("timestamp", 0))
-                except Exception:
-                    ts = now
-                
-                # If time since last tip generation is >= 3, get_tip() will generate a new one
-                # If time is up, we should render and print.
-                if now - ts >= TIP_MIN_SECONDS:
+                if now - last_redraw_time >= 10.0:
                     print(render(last_data), flush=True)
+                    last_redraw_time = now
 
         except EOFError:
             break
