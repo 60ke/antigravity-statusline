@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Antigravity IDE — Status Line Script
-Row 1: model · state · context left · path · quota · session tokens
+Row 1: model · state · context left · path · branch · quota · session tokens
 Row 2: 💡 Tip  (rotates at most once every 3 seconds, persisted across restarts)
 """
 import sys
@@ -107,6 +107,70 @@ def format_reset_time(reset_time: str) -> str:
         days, rem_hours = divmod(hours, 24)
         return f"{days}d {rem_hours}h" if rem_hours else f"{days}d"
     return f"{hours}h {mins}m" if mins else f"{hours}h"
+
+
+_GIT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def get_git_info(cwd_raw: str) -> str:
+    if not cwd_raw:
+        return ""
+    cwd_dir = os.path.expanduser(cwd_raw)
+    if not os.path.isdir(cwd_dir):
+        return ""
+
+    now = time.time()
+    cached = _GIT_CACHE.get(cwd_dir)
+    if cached and (now - cached[0]) < 1.5:
+        return cached[1]
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", cwd_dir, "rev-parse", "--is-inside-work-tree", "--abbrev-ref", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.4,
+        )
+        if res.returncode != 0:
+            _GIT_CACHE[cwd_dir] = (now, "")
+            return ""
+
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if not lines or lines[0] != "true":
+            _GIT_CACHE[cwd_dir] = (now, "")
+            return ""
+
+        branch = lines[1] if len(lines) > 1 else ""
+        if not branch or branch == "HEAD":
+            rev = subprocess.run(
+                ["git", "-C", cwd_dir, "rev-parse", "--short", "HEAD"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=0.3,
+            )
+            short_hash = rev.stdout.strip()
+            branch = f":{short_hash}" if rev.returncode == 0 and short_hash else "detached"
+
+        # Check for uncommitted or untracked changes
+        status_res = subprocess.run(
+            ["git", "-C", cwd_dir, "status", "--porcelain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.4,
+        )
+        is_dirty = bool(status_res.returncode == 0 and status_res.stdout.strip())
+
+        dirty_indicator = f"{YELLOW}*{RESET}" if is_dirty else ""
+        display = f"{MAGENTA} {branch}{RESET}{dirty_indicator}"
+
+        _GIT_CACHE[cwd_dir] = (now, display)
+        return display
+    except Exception:
+        _GIT_CACHE[cwd_dir] = (now, "")
+        return ""
 
 
 def extract_arg(command_line: str, name: str) -> str:
@@ -472,29 +536,38 @@ def render(data: dict) -> str:
         quota_display = f"{GRAY}⬡ Quota: sync /usage{RESET}"
 
     # 6. Working directory
-    cwd  = data.get("cwd", "")
+    cwd_raw = data.get("cwd") or os.getcwd()
+    cwd  = cwd_raw
     home = os.path.expanduser("~")
     if cwd.startswith(home):
         cwd = "~" + cwd[len(home):]
     path_display = f"{GREEN}{cwd}{RESET}"
 
-    # 7. Sandbox badge
+    # 7. Git branch status
+    git_display = get_git_info(cwd_raw)
+
+    # 8. Sandbox badge
     sandbox_enabled = data.get("sandbox", {}).get("enabled", False)
     sandbox_str = f" {ORANGE}[sandbox]{RESET}" if sandbox_enabled else ""
 
-    # 8. Tip (stable for ≥ 3 s)
+    # 9. Tip (stable for ≥ 3 s)
     tip         = get_tip()
     tip_display = f"{BLUE}💡 {tip}{RESET}"
 
     # ── Assemble rows ──────────────────────────────────────────────────────────
-    row1 = (
-        f"{model_display}{SEP}"
-        f"{state_display}{SEP}"
-        f"{ctx_display}{SEP}"
-        f"{path_display}{sandbox_str}{SEP}"
-        f"{quota_display}{SEP}"
-        f"{tokens_display}"
-    )
+    segments = [
+        model_display,
+        state_display,
+        ctx_display,
+        f"{path_display}{sandbox_str}",
+    ]
+    if git_display:
+        segments.append(git_display)
+    segments.extend([
+        quota_display,
+        tokens_display,
+    ])
+    row1 = SEP.join(segments)
     row2 = f"  {tip_display}"
 
     return f"{row1}\n{row2}"
