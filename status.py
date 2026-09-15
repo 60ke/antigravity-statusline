@@ -77,6 +77,10 @@ STATUS_STATE_FILE = os.environ.get(
     "AGY_STATUS_STATE",
     os.path.expanduser("~/.antigravity/status-state.json"),
 )
+STATUS_DEBUG_FILE = os.environ.get(
+    "AGY_STATUS_DEBUG_FILE",
+    os.path.expanduser("~/.antigravity/latest-payload.json"),
+)
 QUOTA_MAX_AGE_SECONDS = float(os.environ.get("AGY_QUOTA_MAX_AGE_SECONDS", "900"))
 QUOTA_REFRESH_INTERVAL_SECONDS = float(os.environ.get("AGY_QUOTA_REFRESH_INTERVAL_SECONDS", "30"))
 USER_STATUS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
@@ -111,13 +115,7 @@ def quota_color(pct: float) -> str:
     return RED
 
 
-def format_reset_time(reset_time: str) -> str:
-    try:
-        reset = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
-        diff = int((reset - datetime.now(timezone.utc)).total_seconds())
-    except Exception:
-        return ""
-
+def format_seconds(diff: int) -> str:
     if diff <= 0:
         return "now"
     minutes = (diff + 59) // 60
@@ -128,6 +126,15 @@ def format_reset_time(reset_time: str) -> str:
         days, rem_hours = divmod(hours, 24)
         return f"{days}d {rem_hours}h" if rem_hours else f"{days}d"
     return f"{hours}h {mins}m" if mins else f"{hours}h"
+
+
+def format_reset_time(reset_time: str) -> str:
+    try:
+        reset = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+        diff = int((reset - datetime.now(timezone.utc)).total_seconds())
+        return format_seconds(diff)
+    except Exception:
+        return ""
 
 
 _GIT_CACHE: dict[str, tuple[float, str]] = {}
@@ -399,6 +406,16 @@ def write_status_state(data: dict) -> None:
         pass
 
 
+def write_debug_payload(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATUS_DEBUG_FILE), exist_ok=True)
+        with open(STATUS_DEBUG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception:
+        pass
+
+
 def scope_mismatch(cache: dict, data: dict) -> str:
     expected = quota_scope(data)
     actual = cache.get("scope", {})
@@ -445,7 +462,58 @@ def refresh_quota_if_needed(data: dict) -> dict:
 
 
 def load_quota_for_model(model_name: str, data: dict) -> dict:
-    """Read the latest /usage cache and return the entry for the active model."""
+    """Extract quota for active model: prefer data['quota'] if present, else fallback to cache."""
+    # 1. Prefer direct quota dictionary from Antigravity CLI payload
+    quotas = data.get("quota")
+    if isinstance(quotas, dict) and quotas:
+        name_lower = (model_name or "").lower()
+        is_3p = any(k in name_lower for k in ("claude", "sonnet", "haiku", "opus", "gpt", "o1", "o3", "3p"))
+        prefix = "3p" if is_3p else "gemini"
+
+        q_5h = quotas.get(f"{prefix}-5h")
+        q_weekly = quotas.get(f"{prefix}-weekly")
+        if not q_5h and not q_weekly:
+            q_5h = quotas.get("gemini-5h") or quotas.get("3p-5h")
+            q_weekly = quotas.get("gemini-weekly") or quotas.get("3p-weekly")
+
+        def parse_quota_entry(q):
+            if not isinstance(q, dict) or "remaining_fraction" not in q:
+                return None
+            pct = max(0.0, min(100.0, float(q["remaining_fraction"]) * 100))
+            reset_time = q.get("reset_time") or ""
+            refreshes_in = ""
+            if reset_time:
+                refreshes_in = format_reset_time(reset_time)
+            if not refreshes_in and "reset_in_seconds" in q:
+                try:
+                    refreshes_in = format_seconds(int(q["reset_in_seconds"]))
+                except Exception:
+                    pass
+            return {
+                "remaining_percentage": pct,
+                "reset_time": reset_time,
+                "refreshes_in": refreshes_in,
+            }
+
+        entry_5h = parse_quota_entry(q_5h)
+        entry_weekly = parse_quota_entry(q_weekly)
+
+        if entry_5h or entry_weekly:
+            result = {
+                "name": model_name,
+                "source": "payload",
+                "5h": entry_5h,
+                "weekly": entry_weekly,
+            }
+            primary = entry_5h or entry_weekly
+            if entry_weekly and entry_5h and entry_weekly["remaining_percentage"] < 10.0:
+                primary = entry_weekly
+            result["remaining_percentage"] = primary["remaining_percentage"]
+            result["reset_time"] = primary.get("reset_time", "")
+            result["refreshes_in"] = primary.get("refreshes_in", "")
+            return result
+
+    # 2. Fallback to cached / local language server RPC
     cache = refresh_quota_if_needed(data)
     if not cache:
         return {}
@@ -517,6 +585,22 @@ def render(data: dict) -> str:
     if quota.get("stale"):
         reason = quota.get("reason", "stale")
         quota_display = f"{GRAY}⬡ Quota: sync /usage ({reason}){RESET}"
+    elif quota.get("5h") or quota.get("weekly"):
+        parts = []
+        if quota.get("5h"):
+            q5 = quota["5h"]
+            p5 = float(q5["remaining_percentage"])
+            c5 = quota_color(p5)
+            r5 = f" {GRAY}({q5['refreshes_in']}){RESET}" if q5.get("refreshes_in") else ""
+            parts.append(f"{c5}⬡ 5h: {p5:.0f}%{RESET}{r5}")
+        if quota.get("weekly"):
+            qw = quota["weekly"]
+            pw = float(qw["remaining_percentage"])
+            cw = quota_color(pw)
+            rw = f" {GRAY}({qw['refreshes_in']}){RESET}" if qw.get("refreshes_in") else ""
+            label = "Wk" if parts else "⬡ Wk"
+            parts.append(f"{cw}{label}: {pw:.0f}%{RESET}{rw}")
+        quota_display = f" {GRAY}·{RESET} ".join(parts)
     elif "remaining_percentage" in quota:
         quota_pct = float(quota["remaining_percentage"])
         qc = quota_color(quota_pct)
@@ -618,11 +702,13 @@ def main():
                         try:
                             data, idx = decoder.raw_decode(stripped)
                             buffer = stripped[idx:]
-                            if isinstance(data, dict) and "model" in data:
-                                write_status_state(data)
-                                last_data = data
-                                print(render(last_data), flush=True)
-                                last_redraw_time = time.time()
+                            if isinstance(data, dict):
+                                write_debug_payload(data)
+                                if "model" in data:
+                                    write_status_state(data)
+                                    last_data = data
+                                    print(render(last_data), flush=True)
+                                    last_redraw_time = time.time()
                         except json.JSONDecodeError:
                             break
             
