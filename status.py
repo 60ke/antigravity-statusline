@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Antigravity IDE — Status Line Script
-Row 1: model · state · context left · path · quota · session tokens
-Row 2: 💡 Tip  (rotates at most once every 3 seconds, persisted across restarts)
+Responsive status line with dynamic multi-line wrapping:
+model · state · context left · path · branch · quota · session tokens
 """
 import sys
 import json
 import time
 import os
-import random
 import select
 import re
 import subprocess
 import http.client
 import ssl
+import shutil
 from datetime import datetime, timezone
 
 # ── ANSI Colors ────────────────────────────────────────────────────────────────
@@ -30,24 +30,45 @@ CYAN         = "\033[36m"
 BLUE         = "\033[34m"
 PURPLE       = "\033[38;5;141m"
 
-# ── Tips ───────────────────────────────────────────────────────────────────────
-TIPS = [
-    "Use /goal for complex, multi-step tasks that need deep focus.",
-    "Press Ctrl+O to expand tool output details inline.",
-    "Try /grill-me to refine your implementation plan interactively.",
-    "Use /agents to see all active sub-agents and their status.",
-    "Mention @conversation to reference past work in any session.",
-    "Run agy --sandbox for restricted, sandboxed command execution.",
-    "Use /schedule to automate recurring tasks or set reminders.",
-    "Press Ctrl+R to search through your full command history.",
-    "Use /changelog to see what's new in the latest release.",
-    "Drag a file into the chat to attach it as context.",
-    "Use /goal overnight for thorough, unattended long-running tasks.",
-    "Prefix a message with ! to run it as a shell command directly.",
-]
+# ── Responsive & Width Helpers ─────────────────────────────────────────────────
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
-TIP_CACHE_FILE = "/tmp/agy_status_tip.json"
-TIP_MIN_SECONDS = 3.0   # minimum seconds before rotating to the next tip
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def visible_length(text: str) -> int:
+    return len(strip_ansi(text))
+
+
+def get_terminal_width(data: dict) -> int:
+    w = data.get("terminal_width")
+    if isinstance(w, (int, float)) and w > 0:
+        return int(w)
+    w = data.get("columns")
+    if isinstance(w, (int, float)) and w > 0:
+        return int(w)
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        pass
+    try:
+        return int(os.environ.get("COLUMNS", 80))
+    except Exception:
+        return 80
+
+
+def shorten_path(path: str, max_chars: int = 28) -> str:
+    if len(path) <= max_chars:
+        return path
+    parts = path.split(os.sep)
+    if len(parts) <= 2:
+        return path
+    shortened = parts[0] + os.sep + "…" + os.sep + os.sep.join(parts[-2:])
+    return shortened if len(shortened) < len(path) else path
+
+
 QUOTA_CACHE_FILE = os.environ.get(
     "AGY_QUOTA_CACHE",
     os.path.expanduser("~/.antigravity/quota-cache.json"),
@@ -55,6 +76,10 @@ QUOTA_CACHE_FILE = os.environ.get(
 STATUS_STATE_FILE = os.environ.get(
     "AGY_STATUS_STATE",
     os.path.expanduser("~/.antigravity/status-state.json"),
+)
+STATUS_DEBUG_FILE = os.environ.get(
+    "AGY_STATUS_DEBUG_FILE",
+    os.path.expanduser("~/.antigravity/latest-payload.json"),
 )
 QUOTA_MAX_AGE_SECONDS = float(os.environ.get("AGY_QUOTA_MAX_AGE_SECONDS", "900"))
 QUOTA_REFRESH_INTERVAL_SECONDS = float(os.environ.get("AGY_QUOTA_REFRESH_INTERVAL_SECONDS", "30"))
@@ -90,13 +115,7 @@ def quota_color(pct: float) -> str:
     return RED
 
 
-def format_reset_time(reset_time: str) -> str:
-    try:
-        reset = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
-        diff = int((reset - datetime.now(timezone.utc)).total_seconds())
-    except Exception:
-        return ""
-
+def format_seconds(diff: int) -> str:
     if diff <= 0:
         return "now"
     minutes = (diff + 59) // 60
@@ -107,6 +126,79 @@ def format_reset_time(reset_time: str) -> str:
         days, rem_hours = divmod(hours, 24)
         return f"{days}d {rem_hours}h" if rem_hours else f"{days}d"
     return f"{hours}h {mins}m" if mins else f"{hours}h"
+
+
+def format_reset_time(reset_time: str) -> str:
+    try:
+        reset = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+        diff = int((reset - datetime.now(timezone.utc)).total_seconds())
+        return format_seconds(diff)
+    except Exception:
+        return ""
+
+
+_GIT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def get_git_info(cwd_raw: str) -> str:
+    if not cwd_raw:
+        return ""
+    cwd_dir = os.path.expanduser(cwd_raw)
+    if not os.path.isdir(cwd_dir):
+        return ""
+
+    now = time.time()
+    cached = _GIT_CACHE.get(cwd_dir)
+    if cached and (now - cached[0]) < 1.5:
+        return cached[1]
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", cwd_dir, "rev-parse", "--is-inside-work-tree", "--abbrev-ref", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.4,
+        )
+        if res.returncode != 0:
+            _GIT_CACHE[cwd_dir] = (now, "")
+            return ""
+
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if not lines or lines[0] != "true":
+            _GIT_CACHE[cwd_dir] = (now, "")
+            return ""
+
+        branch = lines[1] if len(lines) > 1 else ""
+        if not branch or branch == "HEAD":
+            rev = subprocess.run(
+                ["git", "-C", cwd_dir, "rev-parse", "--short", "HEAD"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=0.3,
+            )
+            short_hash = rev.stdout.strip()
+            branch = f":{short_hash}" if rev.returncode == 0 and short_hash else "detached"
+
+        # Check for uncommitted or untracked changes
+        status_res = subprocess.run(
+            ["git", "-C", cwd_dir, "status", "--porcelain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.4,
+        )
+        is_dirty = bool(status_res.returncode == 0 and status_res.stdout.strip())
+
+        dirty_indicator = f"{YELLOW}*{RESET}" if is_dirty else ""
+        display = f"{MAGENTA} {branch}{RESET}{dirty_indicator}"
+
+        _GIT_CACHE[cwd_dir] = (now, display)
+        return display
+    except Exception:
+        _GIT_CACHE[cwd_dir] = (now, "")
+        return ""
 
 
 def extract_arg(command_line: str, name: str) -> str:
@@ -314,6 +406,16 @@ def write_status_state(data: dict) -> None:
         pass
 
 
+def write_debug_payload(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATUS_DEBUG_FILE), exist_ok=True)
+        with open(STATUS_DEBUG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception:
+        pass
+
+
 def scope_mismatch(cache: dict, data: dict) -> str:
     expected = quota_scope(data)
     actual = cache.get("scope", {})
@@ -360,7 +462,69 @@ def refresh_quota_if_needed(data: dict) -> dict:
 
 
 def load_quota_for_model(model_name: str, data: dict) -> dict:
-    """Read the latest /usage cache and return the entry for the active model."""
+    """Extract quota for active model: prefer data['quota'] if present, else fallback to cache."""
+    # 1. Prefer direct quota dictionary from Antigravity CLI payload
+    quotas = data.get("quota")
+    if isinstance(quotas, dict) and quotas:
+        name_lower = (model_name or "").lower()
+        is_argon = "argon" in name_lower
+        is_3p = any(k in name_lower for k in ("claude", "sonnet", "haiku", "opus", "gpt", "o1", "o3", "3p"))
+
+        if is_argon:
+            q_5h = next(
+                (v for k, v in quotas.items() if "argon" in k.lower() and "5h" in k.lower()),
+                None,
+            )
+            q_weekly = quotas.get("gemini-argon-wtu-weekly") or next(
+                (v for k, v in quotas.items() if "argon" in k.lower() and "weekly" in k.lower()),
+                None,
+            )
+        else:
+            prefix = "3p" if is_3p else "gemini"
+            q_5h = quotas.get(f"{prefix}-5h")
+            q_weekly = quotas.get(f"{prefix}-weekly")
+            if not q_5h and not q_weekly:
+                q_5h = quotas.get("gemini-5h") or quotas.get("3p-5h")
+                q_weekly = quotas.get("gemini-weekly") or quotas.get("3p-weekly")
+
+        def parse_quota_entry(q):
+            if not isinstance(q, dict) or "remaining_fraction" not in q:
+                return None
+            pct = max(0.0, min(100.0, float(q["remaining_fraction"]) * 100))
+            reset_time = q.get("reset_time") or ""
+            refreshes_in = ""
+            if reset_time:
+                refreshes_in = format_reset_time(reset_time)
+            if not refreshes_in and "reset_in_seconds" in q:
+                try:
+                    refreshes_in = format_seconds(int(q["reset_in_seconds"]))
+                except Exception:
+                    pass
+            return {
+                "remaining_percentage": pct,
+                "reset_time": reset_time,
+                "refreshes_in": refreshes_in,
+            }
+
+        entry_5h = parse_quota_entry(q_5h)
+        entry_weekly = parse_quota_entry(q_weekly)
+
+        if entry_5h or entry_weekly:
+            result = {
+                "name": model_name,
+                "source": "payload",
+                "5h": entry_5h,
+                "weekly": entry_weekly,
+            }
+            primary = entry_5h or entry_weekly
+            if entry_weekly and entry_5h and entry_weekly["remaining_percentage"] < 10.0:
+                primary = entry_weekly
+            result["remaining_percentage"] = primary["remaining_percentage"]
+            result["reset_time"] = primary.get("reset_time", "")
+            result["refreshes_in"] = primary.get("refreshes_in", "")
+            return result
+
+    # 2. Fallback to cached / local language server RPC
     cache = refresh_quota_if_needed(data)
     if not cache:
         return {}
@@ -388,36 +552,6 @@ def load_quota_for_model(model_name: str, data: dict) -> dict:
     return {}
 
 
-def get_tip(force_rotate=False) -> str:
-    """Return the current tip. Rotate if force_rotate is True or if time is up."""
-    now = time.time()
-    tip = ""
-    ts = 0.0
-
-    try:
-        with open(TIP_CACHE_FILE, "r") as f:
-            cache = json.load(f)
-        tip = cache.get("tip", "")
-        ts  = float(cache.get("timestamp", 0))
-    except Exception:
-        pass
-
-    if tip and not force_rotate and (now - ts) < TIP_MIN_SECONDS:
-        return tip
-
-    # Pick a new tip that's different from the current one if possible
-    choices = [t for t in TIPS if t != tip] or TIPS
-    new_tip = random.choice(choices)
-    
-    try:
-        with open(TIP_CACHE_FILE, "w") as f:
-            json.dump({"tip": new_tip, "timestamp": now}, f)
-    except Exception:
-        pass
-        
-    return new_tip
-
-
 # ── Rendering ──────────────────────────────────────────────────────────────────
 SEP = f" {GRAY}│{RESET} "
 
@@ -426,7 +560,7 @@ def render(data: dict) -> str:
     # 1. Model
     model_info = data.get("model", {})
     if isinstance(model_info, dict):
-        raw_name = model_info.get("display_name") or model_info.get("id") or "AGY"
+        raw_name = model_info.get("display_name") or model_info.get("displayName") or model_info.get("id") or "AGY"
     else:
         raw_name = str(model_info) or "AGY"
     model_display = f"{YELLOW}{BOLD}{raw_name}{RESET}"
@@ -462,6 +596,22 @@ def render(data: dict) -> str:
     if quota.get("stale"):
         reason = quota.get("reason", "stale")
         quota_display = f"{GRAY}⬡ Quota: sync /usage ({reason}){RESET}"
+    elif quota.get("5h") or quota.get("weekly"):
+        parts = []
+        if quota.get("5h"):
+            q5 = quota["5h"]
+            p5 = float(q5["remaining_percentage"])
+            c5 = quota_color(p5)
+            r5 = f" {GRAY}({q5['refreshes_in']}){RESET}" if q5.get("refreshes_in") else ""
+            parts.append(f"{c5}⬡ 5h: {p5:.0f}%{RESET}{r5}")
+        if quota.get("weekly"):
+            qw = quota["weekly"]
+            pw = float(qw["remaining_percentage"])
+            cw = quota_color(pw)
+            rw = f" {GRAY}({qw['refreshes_in']}){RESET}" if qw.get("refreshes_in") else ""
+            label = "Wk" if parts else "⬡ Wk"
+            parts.append(f"{cw}{label}: {pw:.0f}%{RESET}{rw}")
+        quota_display = f" {GRAY}·{RESET} ".join(parts)
     elif "remaining_percentage" in quota:
         quota_pct = float(quota["remaining_percentage"])
         qc = quota_color(quota_pct)
@@ -472,32 +622,68 @@ def render(data: dict) -> str:
         quota_display = f"{GRAY}⬡ Quota: sync /usage{RESET}"
 
     # 6. Working directory
-    cwd  = data.get("cwd", "")
+    cwd_raw = data.get("cwd") or os.getcwd()
+    cwd  = cwd_raw
     home = os.path.expanduser("~")
     if cwd.startswith(home):
         cwd = "~" + cwd[len(home):]
+
+    term_width = get_terminal_width(data)
+    if term_width < 80 and len(cwd) > 28:
+        cwd = shorten_path(cwd, 24)
+
     path_display = f"{GREEN}{cwd}{RESET}"
 
-    # 7. Sandbox badge
+    # 7. Git branch status
+    git_display = get_git_info(cwd_raw)
+
+    # 8. Sandbox badge
     sandbox_enabled = data.get("sandbox", {}).get("enabled", False)
     sandbox_str = f" {ORANGE}[sandbox]{RESET}" if sandbox_enabled else ""
 
-    # 8. Tip (stable for ≥ 3 s)
-    tip         = get_tip()
-    tip_display = f"{BLUE}💡 {tip}{RESET}"
+    # ── Assemble segments ──────────────────────────────────────────────────────
+    segments = [
+        model_display,
+        state_display,
+        ctx_display,
+        f"{path_display}{sandbox_str}",
+    ]
+    if git_display:
+        segments.append(git_display)
+    segments.extend([
+        quota_display,
+        tokens_display,
+    ])
 
-    # ── Assemble rows ──────────────────────────────────────────────────────────
-    row1 = (
-        f"{model_display}{SEP}"
-        f"{state_display}{SEP}"
-        f"{ctx_display}{SEP}"
-        f"{path_display}{sandbox_str}{SEP}"
-        f"{quota_display}{SEP}"
-        f"{tokens_display}"
-    )
-    row2 = f"  {tip_display}"
+    # ── Responsive Line Packing ────────────────────────────────────────────────
+    sep_vis_len = visible_length(SEP)
+    total_single_line_len = sum(visible_length(s) for s in segments) + sep_vis_len * (len(segments) - 1)
 
-    return f"{row1}\n{row2}"
+    if total_single_line_len <= term_width:
+        return SEP.join(segments)
+
+    rows: list[str] = []
+    current_row: list[str] = []
+    current_row_len = 0
+
+    for seg in segments:
+        seg_len = visible_length(seg)
+        if not current_row:
+            current_row.append(seg)
+            current_row_len = seg_len
+        else:
+            if current_row_len + sep_vis_len + seg_len <= term_width:
+                current_row.append(seg)
+                current_row_len += sep_vis_len + seg_len
+            else:
+                rows.append(SEP.join(current_row))
+                current_row = [seg]
+                current_row_len = seg_len
+
+    if current_row:
+        rows.append(SEP.join(current_row))
+
+    return "\n".join(rows)
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -527,32 +713,21 @@ def main():
                         try:
                             data, idx = decoder.raw_decode(stripped)
                             buffer = stripped[idx:]
-                            if isinstance(data, dict) and "model" in data:
-                                write_status_state(data)
-                                last_data = data
-                                print(render(last_data), flush=True)
-                                last_redraw_time = time.time()
+                            if isinstance(data, dict):
+                                write_debug_payload(data)
+                                if "model" in data:
+                                    write_status_state(data)
+                                    last_data = data
+                                    print(render(last_data), flush=True)
+                                    last_redraw_time = time.time()
                         except json.JSONDecodeError:
                             break
             
-            # If no input arrived recently, but we have last_data, check if we should rotate tip
             elif last_data:
                 now = time.time()
-                # Check if 3 seconds have passed since we last got a new tip
-                # get_tip() handles the 3-second cache logic internally
-                current_tip = get_tip()
-                # To actually redraw on idle state, we force print if 3 seconds passed
-                try:
-                    with open(TIP_CACHE_FILE, "r") as f:
-                        cache = json.load(f)
-                        ts = float(cache.get("timestamp", 0))
-                except Exception:
-                    ts = now
-                
-                # If time since last tip generation is >= 3, get_tip() will generate a new one
-                # If time is up, we should render and print.
-                if now - ts >= TIP_MIN_SECONDS:
+                if now - last_redraw_time >= 10.0:
                     print(render(last_data), flush=True)
+                    last_redraw_time = now
 
         except EOFError:
             break
