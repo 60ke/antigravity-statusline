@@ -467,14 +467,25 @@ def load_quota_for_model(model_name: str, data: dict) -> dict:
     quotas = data.get("quota")
     if isinstance(quotas, dict) and quotas:
         name_lower = (model_name or "").lower()
+        is_argon = "argon" in name_lower
         is_3p = any(k in name_lower for k in ("claude", "sonnet", "haiku", "opus", "gpt", "o1", "o3", "3p"))
-        prefix = "3p" if is_3p else "gemini"
 
-        q_5h = quotas.get(f"{prefix}-5h")
-        q_weekly = quotas.get(f"{prefix}-weekly")
-        if not q_5h and not q_weekly:
-            q_5h = quotas.get("gemini-5h") or quotas.get("3p-5h")
-            q_weekly = quotas.get("gemini-weekly") or quotas.get("3p-weekly")
+        if is_argon:
+            q_5h = next(
+                (v for k, v in quotas.items() if "argon" in k.lower() and "5h" in k.lower()),
+                None,
+            )
+            q_weekly = quotas.get("gemini-argon-wtu-weekly") or next(
+                (v for k, v in quotas.items() if "argon" in k.lower() and "weekly" in k.lower()),
+                None,
+            )
+        else:
+            prefix = "3p" if is_3p else "gemini"
+            q_5h = quotas.get(f"{prefix}-5h")
+            q_weekly = quotas.get(f"{prefix}-weekly")
+            if not q_5h and not q_weekly:
+                q_5h = quotas.get("gemini-5h") or quotas.get("3p-5h")
+                q_weekly = quotas.get("gemini-weekly") or quotas.get("3p-weekly")
 
         def parse_quota_entry(q):
             if not isinstance(q, dict) or "remaining_fraction" not in q:
